@@ -9,7 +9,6 @@ from itertools import chain
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.utils import shuffle
@@ -462,83 +461,8 @@ class CyclicLR:
         set_lr(self.optimizer, self.clr())
 
 
-# model
-
-class Capsule(nn.Module):
-    def __init__(self, input_dim_capsule=1024, num_capsule=5, dim_capsule=5, routings=4):
-        super(Capsule, self).__init__()
-        self.num_capsule = num_capsule
-        self.dim_capsule = dim_capsule
-        self.routings = routings
-        self.activation = self.squash
-        self.W = nn.Parameter(
-            nn.init.xavier_normal_(torch.empty(1, input_dim_capsule, self.num_capsule * self.dim_capsule)))
-
-    def forward(self, x):
-        u_hat_vecs = torch.matmul(x, self.W)
-        batch_size = x.size(0)
-        input_num_capsule = x.size(1)
-        u_hat_vecs = u_hat_vecs.view((batch_size, input_num_capsule,
-                                      self.num_capsule, self.dim_capsule))
-        u_hat_vecs = u_hat_vecs.permute(0, 2, 1,
-                                        3).contiguous()  # (batch_size,num_capsule,input_num_capsule,dim_capsule)
-        with torch.no_grad():
-            b = torch.zeros_like(u_hat_vecs[:, :, :, 0])
-        for i in range(self.routings):
-            c = torch.nn.functional.softmax(b, dim=1)  # (batch_size,num_capsule,input_num_capsule)
-            outputs = self.activation(torch.sum(c.unsqueeze(-1) * u_hat_vecs, dim=2))  # bij,bijk->bik
-            if i < self.routings - 1:
-                b = (torch.sum(outputs.unsqueeze(2) * u_hat_vecs, dim=-1))  # bik,bijk->bij
-        return outputs  # (batch_size, num_capsule, dim_capsule)
-
-    def squash(self, x, axis=-1):
-        s_squared_norm = (x ** 2).sum(axis, keepdim=True)
-        scale = torch.sqrt(s_squared_norm + 1e-7)
-        return x / scale
-
-
-#  model
-class Attention(nn.Module):
-    def __init__(self, feature_dim, max_seq_len=70):
-        super().__init__()
-        self.attention_fc = nn.Linear(feature_dim, 1)
-        self.bias = nn.Parameter(torch.zeros(1, max_seq_len, 1, requires_grad=True))
-
-    def forward(self, rnn_output):
-        """
-        forward attention scores and attended vectors
-        :param rnn_output: (#batch,#seq_len,#feature)
-        :return: attended_outputs (#batch,#feature)
-        """
-        attention_weights = self.attention_fc(rnn_output)
-        seq_len = rnn_output.size(1)
-        attention_weights = self.bias[:, :seq_len, :] + attention_weights
-        attention_weights = torch.tanh(attention_weights)
-        attention_weights = torch.exp(attention_weights)
-        attention_weights_sum = torch.sum(attention_weights, dim=1, keepdim=True) + 1e-7
-        attention_weights = attention_weights / attention_weights_sum
-        attended = torch.sum(attention_weights * rnn_output, dim=1)
-        return attended
-
-
-# evaluation
-def eval_model(model, data_iter, device, order_index=None):
-    model.eval()
-    predictions = []
-    with torch.no_grad():
-        for batch_data in data_iter:
-            qid_batch, src_sents, src_seqs, src_lens, tgts = batch_data
-            src_seqs = src_seqs.to(device)
-            out = model(src_seqs, src_lens, return_logits=False)
-            predictions.append(out)
-    predictions = torch.cat(predictions, dim=0)
-    if order_index is not None:
-        predictions = predictions[order_index]
-    predictions = predictions.to('cpu').numpy().ravel()
-    return predictions
-
-
 # cross validation
+
 
 def cv(train_df, test_df, device=None, n_folds=10, shared_resources=None, share=True, **kwargs):
     if device is None:
