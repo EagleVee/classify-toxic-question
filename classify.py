@@ -15,7 +15,7 @@ from sklearn.utils import shuffle
 from torch import optim
 from torch.utils.data import Dataset, Sampler, DataLoader
 from tqdm import tqdm
-from model import InsincereModel
+from model import ToxicModel
 from util import AverageMeter, count_parameters, margin_score, report_perf, get_gpu_memory_usage, avg
 
 # constants
@@ -461,9 +461,24 @@ class CyclicLR:
         set_lr(self.optimizer, self.clr())
 
 
+# evaluation
+def eval_model(model, data_iter, device, order_index=None):
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for batch_data in data_iter:
+            qid_batch, src_sents, src_seqs, src_lens, tgts = batch_data
+            src_seqs = src_seqs.to(device)
+            out = model(src_seqs, src_lens, return_logits=False)
+            predictions.append(out)
+    predictions = torch.cat(predictions, dim=0)
+    if order_index is not None:
+        predictions = predictions[order_index]
+    predictions = predictions.to('cpu').numpy().ravel()
+    return predictions
+
+
 # cross validation
-
-
 def cv(train_df, test_df, device=None, n_folds=10, shared_resources=None, share=True, **kwargs):
     if device is None:
         device = torch.device("cuda:{}".format(0) if torch.cuda.is_available() else "cpu")
@@ -584,10 +599,10 @@ def main(train_df, valid_df, test_df, device=None, epochs=3, fine_tuning_epochs=
     valid_index_reverse = vb.get_reverse_indexes()
     # init model and optimizers
 
-    model = InsincereModel(device, hidden_dim=256, hidden_dim_fc=16, dropout=dropout,
-                           embedding_matrixs=embedding_matrix,
-                           vocab_size=len(vocab['token2id']),
-                           embedding_dim=embed_size, max_seq_len=max_seq_len)
+    model = ToxicModel(device, hidden_dim=256, hidden_dim_fc=16, dropout=dropout,
+                       embedding_matrixs=embedding_matrix,
+                       vocab_size=len(vocab['token2id']),
+                       embedding_dim=embed_size, max_seq_len=max_seq_len)
     if os.path.exists(model_path):
         print('loading model...')
         model.load_state_dict(torch.load(model_path))  # get model if already in
@@ -693,8 +708,6 @@ def main(train_df, valid_df, test_df, device=None, epochs=3, fine_tuning_epochs=
         if not fine_tuning:
             predictions_va = eval_model(model, valid_iter, device, valid_index_reverse)
             report_perf(valid_dataset, predictions_va, threshold, idx, epoch)
-    # pprint(model.attention1.bias.data.to('cpu'))
-    # pprint(model.attention2.bias.data.to('cpu'))
     # reorder index
     torch.save(model.state_dict(), model_path)
     if predictions_te is not None:
@@ -718,39 +731,53 @@ def main(train_df, valid_df, test_df, device=None, epochs=3, fine_tuning_epochs=
     return predictions_te, predictions_va, valid_dataset.targets, best_threshold
 
 
-# seeding
-set_seed(233)
-epochs = 8
-batch_size = 512
-learning_rate = 0.001
-learning_rate_max_offset = 0.002
-fine_tuning_epochs = 2
-threshold = 0.31
-max_vocab_size = 120000
-embed_size = 300
-print_every_step = 500
-max_seq_len = 70
-share = True
-dropout = 0.1
-sub = pd.read_csv('./input/sample_submission.csv')
-train_df, test_df = load_data()
-# shuffling
-trn_idx = np.random.permutation(len(train_df))
-train_df = train_df.iloc[trn_idx].reset_index(drop=True)
-n_folds = 5
-n_repeats = 1
-args = {'epochs': epochs, 'batch_size': batch_size, 'learning_rate': learning_rate, 'threshold': threshold,
-        'max_vocab_size': max_vocab_size,
-        'embed_size': embed_size, 'print_every_step': print_every_step, 'dropout': dropout,
-        'learning_rate_max_offset': learning_rate_max_offset,
-        'fine_tuning_epochs': fine_tuning_epochs, 'max_seq_len': max_seq_len}
-predictions_te_all = np.zeros((len(test_df),))
-for _ in range(n_repeats):
-    if n_folds > 1:
-        _, predictions_te, _, threshold, coeffs = cv(train_df, test_df, n_folds=n_folds, share=share, **args)
-        print('coeff between predictions {}'.format(coeffs))
+question_path = './question.txt'
+
+
+if __name__ == '__main__':
+    # seeding
+    set_seed(233)
+    epochs = 8
+    batch_size = 512
+    learning_rate = 0.001
+    learning_rate_max_offset = 0.002
+    fine_tuning_epochs = 2
+    threshold = 0.31
+    max_vocab_size = 120000
+    embed_size = 300
+    print_every_step = 500
+    max_seq_len = 70
+    share = True
+    dropout = 0.1
+    sub = pd.read_csv('./input/sample_submission.csv')
+    train_df, test_df = load_data()
+    is_training = False
+    # shuffling
+    trn_idx = np.random.permutation(len(train_df))
+    train_df = train_df.iloc[trn_idx].reset_index(drop=True)
+    n_folds = 5
+    n_repeats = 1
+    args = {'epochs': epochs, 'batch_size': batch_size, 'learning_rate': learning_rate, 'threshold': threshold,
+            'max_vocab_size': max_vocab_size,
+            'embed_size': embed_size, 'print_every_step': print_every_step, 'dropout': dropout,
+            'learning_rate_max_offset': learning_rate_max_offset,
+            'fine_tuning_epochs': fine_tuning_epochs, 'max_seq_len': max_seq_len}
+    predictions_te_all = np.zeros((len(test_df),))
+    if is_training:
+        for _ in range(n_repeats):
+            if n_folds > 1:
+                _, predictions_te, _, threshold, coeffs = cv(train_df, test_df, n_folds=n_folds, share=share, **args)
+                print('coeff between predictions {}'.format(coeffs))
+            else:
+                predictions_te, _, _, _ = main(train_df, test_df, test_df, **args)
+            predictions_te_all += predictions_te / n_repeats
+        sub.prediction = predictions_te_all > threshold
+        sub.to_csv("submission.csv", index=False)
     else:
-        predictions_te, _, _, _ = main(train_df, test_df, test_df, **args)
-    predictions_te_all += predictions_te / n_repeats
-sub.prediction = predictions_te_all > threshold
-sub.to_csv("submission.csv", index=False)
+        with open('question.txt') as file:
+            question = file.readline()
+            questionInput = [{'question_txt': clean_text(question)}]
+            print(questionInput)
+            # predictions_te, _, _, _ = main(train_df, test_df, test_df, **args)
+
+

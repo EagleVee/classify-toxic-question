@@ -59,29 +59,12 @@ class Attention(nn.Module):
         return attended
 
 
-# evaluation
-def eval_model(model, data_iter, device, order_index=None):
-    model.eval()
-    predictions = []
-    with torch.no_grad():
-        for batch_data in data_iter:
-            qid_batch, src_sents, src_seqs, src_lens, tgts = batch_data
-            src_seqs = src_seqs.to(device)
-            out = model(src_seqs, src_lens, return_logits=False)
-            predictions.append(out)
-    predictions = torch.cat(predictions, dim=0)
-    if order_index is not None:
-        predictions = predictions[order_index]
-    predictions = predictions.to('cpu').numpy().ravel()
-    return predictions
-
-
-class InsincereModel(nn.Module):
+class ToxicModel(nn.Module):
     def __init__(self, device, hidden_dim, hidden_dim_fc, embedding_matrixs, vocab_size=None, embedding_dim=None,
                  dropout=0.1, num_capsule=5, dim_capsule=5, capsule_out_dim=1, alpha=0.8, beta=0.8,
                  finetuning_vocab_size=120002,
                  embedding_mode='mixup', max_seq_len=70):
-        super(InsincereModel, self).__init__()
+        super(ToxicModel, self).__init__()
         self.beta = beta
         self.embedding_mode = embedding_mode
         self.finetuning_vocab_size = finetuning_vocab_size
