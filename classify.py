@@ -685,8 +685,6 @@ def main(train_df, valid_df, test_df, device=None, epochs=3, fine_tuning_epochs=
                                                     mean_len.avg))
                 loss_list = []
 
-                # print(f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                #      f'Data {data_time.val:.3f} ({data_time.avg:.3f})\t')
             if fine_tuning and global_steps % (2 * clr.step_size) == 0:
                 predictions_te_tmp2 = eval_model(model, test_iter, device)
                 predictions_va_tmp2 = eval_model(model, valid_iter, device, valid_index_reverse)
