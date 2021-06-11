@@ -125,10 +125,19 @@ def load_data(train_path=train_path, test_path=test_path, debug=False):
     return train_df, test_df
 
 
+def load_question(question_path='./question.csv', debug=False):
+    question_df = pd.read_csv(question_path)
+    if debug:
+        question_df = question_df[:10000]
+    s = time.time()
+    question_df['question_text'] = question_df['question_text'].apply(clean_text)
+    return question_df
+
+
 # vocabulary functions
 def build_counter(sents, splited=False):
     counter = Counter()
-    for sent in tqdm(sents, ascii=True, desc='building conuter'):
+    for sent in tqdm(sents, ascii=True, desc='building counter'):
         if splited:
             counter.update(sent)
         else:
@@ -560,7 +569,7 @@ def main(train_df, valid_df, test_df, device=None, epochs=3, fine_tuning_epochs=
          learning_rate_max_offset=0.001, dropout=0.1,
          threshold=None,
          max_vocab_size=95000, embed_size=300, max_seq_len=70, print_every_step=500, idx=0, shared_resources=None,
-         return_reduced=True):
+         return_reduced=True, is_training=True):
     if device is None:
         device = torch.device("cuda:{}".format(0) if torch.cuda.is_available() else "cpu")
 
@@ -580,157 +589,167 @@ def main(train_df, valid_df, test_df, device=None, epochs=3, fine_tuning_epochs=
         embedding_matrix = load_embedding(vocab, max_vocab_size, embed_size)
     else:
         embedding_matrix = shared_resources['embedding_matrix']
-    # create test dataset
-    test_dataset = TextDataset(test_df, vocab=vocab, max_seq_len=max_seq_len)
-    tb = BucketSampler(test_dataset, test_dataset.get_keys(), batch_size=batch_size,
-                       shuffle_data=False)
-    test_iter = DataLoader(dataset=test_dataset,
-                           batch_size=batch_size,
-                           sampler=tb,
-                           # shuffle=False,
-                           num_workers=0,
-                           collate_fn=collate_fn)
 
-    train_dataset = TextDataset(train_df, vocab=vocab, max_seq_len=max_seq_len)
-    # keys = train_dataset.get_keys()  # for bucket sorting
-    valid_dataset = TextDataset(valid_df, vocab=vocab, max_seq_len=max_seq_len)
-    vb = BucketSampler(valid_dataset, valid_dataset.get_keys(), batch_size=batch_size,
-                       shuffle_data=False)
-    valid_index_reverse = vb.get_reverse_indexes()
     # init model and optimizers
 
-    model = ToxicModel(device, hidden_dim=256, hidden_dim_fc=16, dropout=dropout,
-                       embedding_matrixs=embedding_matrix,
-                       vocab_size=len(vocab['token2id']),
-                       embedding_dim=embed_size, max_seq_len=max_seq_len)
     if os.path.exists(model_path):
         print('loading model...')
-        model.load_state_dict(torch.load(model_path))  # get model if already in
+        # get model if already trained model exists
+        model = torch.load(model_path)
         print('model loaded')
+    else:
+        model = ToxicModel(device, hidden_dim=256, hidden_dim_fc=16, dropout=dropout,
+                           embedding_matrixs=embedding_matrix,
+                           vocab_size=len(vocab['token2id']),
+                           embedding_dim=embed_size, max_seq_len=max_seq_len)
     if idx == 0:
         print(model)
         print('total trainable {}'.format(count_parameters(model)))
     model = model.to(device)
-    optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=learning_rate)
 
-    # init iterator
-    train_iter = DataLoader(dataset=train_dataset,
-                            batch_size=batch_size,
-                            # shuffle=True,
-                            # sampler=NegativeSubSampler(train_dataset, train_dataset.targets),
-                            sampler=BucketSampler(train_dataset, train_dataset.get_keys(), bucket_size=batch_size * 20,
-                                                  batch_size=batch_size),
-                            num_workers=0,
-                            collate_fn=collate_fn)
-
+    # create valid dataset - for question
+    valid_dataset = TextDataset(valid_df, vocab=vocab, max_seq_len=max_seq_len)
+    vb = BucketSampler(valid_dataset, valid_dataset.get_keys(), batch_size=batch_size,
+                       shuffle_data=False)
+    valid_index_reverse = vb.get_reverse_indexes()
     valid_iter = DataLoader(dataset=valid_dataset,
                             batch_size=batch_size,
                             sampler=vb,
                             # shuffle=False,
+                            num_workers=0,
                             collate_fn=collate_fn)
 
+    # keys = train_dataset.get_keys()  # for bucket sorting
+
     # train model
+    if is_training:
+        # init iterator
+        # create test dataset
+        test_dataset = TextDataset(test_df, vocab=vocab, max_seq_len=max_seq_len)
+        tb = BucketSampler(test_dataset, test_dataset.get_keys(), batch_size=batch_size,
+                           shuffle_data=False)
+        test_iter = DataLoader(dataset=test_dataset,
+                               batch_size=batch_size,
+                               sampler=tb,
+                               # shuffle=False,
+                               num_workers=0,
+                               collate_fn=collate_fn)
+        # create train dataset
+        train_dataset = TextDataset(train_df, vocab=vocab, max_seq_len=max_seq_len)
+        train_iter = DataLoader(dataset=train_dataset,
+                                batch_size=batch_size,
+                                # shuffle=True,
+                                # sampler=NegativeSubSampler(train_dataset, train_dataset.targets),
+                                sampler=BucketSampler(train_dataset, train_dataset.get_keys(),
+                                                      bucket_size=batch_size * 20,
+                                                      batch_size=batch_size),
+                                num_workers=0,
+                                collate_fn=collate_fn)
+        optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=learning_rate)
+        loss_list = []
+        global_steps = 0
+        total_steps = epochs * len(train_iter)
+        loss_fn = torch.nn.BCEWithLogitsLoss()
+        end = time.time()
+        predictions_tes = []
+        predictions_vas = []
+        n_fge = 0
+        clr = CyclicLR(optimizer, base_lr=learning_rate, max_lr=learning_rate + learning_rate_max_offset,
+                       step_size=300, mode='exp_range')
+        clr.on_train_begin()
+        fine_tuning_epochs = epochs - fine_tuning_epochs
+        predictions_te = None
+        for epoch in tqdm(range(epochs)):
+            fine_tuning = epoch >= fine_tuning_epochs
+            start_fine_tuning = fine_tuning_epochs == epoch
+            if start_fine_tuning:
+                model.enable_learning_embedding()
+                optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=learning_rate)
+                # fine tuning embedding layer
+                global_steps = 0
+                total_steps = (epochs - fine_tuning_epochs) * len(train_iter)
+                clr = CyclicLR(optimizer, base_lr=learning_rate, max_lr=learning_rate + learning_rate_max_offset,
+                               step_size=int(len(train_iter) / 8))
+                clr.on_train_begin()
+                predictions_te = np.zeros((len(test_df),))
+                predictions_va = np.zeros((len(valid_dataset.targets),))
+            for batch_data in train_iter:
+                data_time.update(time.time() - end)
+                qids, src_sents, src_seqs, src_lens, tgts = batch_data
+                mean_len.update(sum(src_lens))
+                src_seqs = src_seqs.to(device)
+                tgts = tgts.to(device)
+                model.train()
+                optimizer.zero_grad()
 
-    loss_list = []
-    global_steps = 0
-    total_steps = epochs * len(train_iter)
-    loss_fn = torch.nn.BCEWithLogitsLoss()
-    end = time.time()
-    predictions_tes = []
-    predictions_vas = []
-    n_fge = 0
-    clr = CyclicLR(optimizer, base_lr=learning_rate, max_lr=learning_rate + learning_rate_max_offset,
-                   step_size=300, mode='exp_range')
-    clr.on_train_begin()
-    fine_tuning_epochs = epochs - fine_tuning_epochs
-    predictions_te = None
-    for epoch in tqdm(range(epochs)):
+                out = model(src_seqs, src_lens, return_logits=True).view(-1)
+                loss = loss_fn(out, tgts)
+                loss.backward()
+                optimizer.step()
 
-        fine_tuning = epoch >= fine_tuning_epochs
-        start_fine_tuning = fine_tuning_epochs == epoch
-        if start_fine_tuning:
-            model.enable_learning_embedding()
-            optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=learning_rate)
-            # fine tuning embedding layer
-            global_steps = 0
-            total_steps = (epochs - fine_tuning_epochs) * len(train_iter)
-            clr = CyclicLR(optimizer, base_lr=learning_rate, max_lr=learning_rate + learning_rate_max_offset,
-                           step_size=int(len(train_iter) / 8))
-            clr.on_train_begin()
-            predictions_te = np.zeros((len(test_df),))
-            predictions_va = np.zeros((len(valid_dataset.targets),))
-        for batch_data in train_iter:
-            data_time.update(time.time() - end)
-            qids, src_sents, src_seqs, src_lens, tgts = batch_data
-            mean_len.update(sum(src_lens))
-            src_seqs = src_seqs.to(device)
-            tgts = tgts.to(device)
-            model.train()
-            optimizer.zero_grad()
+                loss_list.append(loss.detach().to('cpu').item())
 
-            out = model(src_seqs, src_lens, return_logits=True).view(-1)
-            loss = loss_fn(out, tgts)
-            loss.backward()
-            optimizer.step()
+                global_steps += 1
+                batch_time.update(time.time() - end)
+                end = time.time()
+                if global_steps % print_every_step == 0:
+                    curr_gpu_memory_usage = get_gpu_memory_usage(device_id=torch.cuda.current_device())
+                    print('Global step: {}/{} Total loss: {:.4f}  Current GPU memory '
+                          'usage: {} maxlen {} '.format(global_steps, total_steps, avg(loss_list),
+                                                        curr_gpu_memory_usage,
+                                                        mean_len.avg))
+                    loss_list = []
 
-            loss_list.append(loss.detach().to('cpu').item())
+                if fine_tuning and global_steps % (2 * clr.step_size) == 0:
+                    predictions_te_tmp2 = eval_model(model, test_iter, device)
+                    predictions_va_tmp2 = eval_model(model, valid_iter, device, valid_index_reverse)
+                    report_perf(valid_dataset, predictions_va_tmp2, threshold, idx, epoch,
+                                desc='val set mean')
+                    predictions_te = predictions_te * n_fge + (
+                        predictions_te_tmp2)
+                    predictions_va = predictions_va * n_fge + (
+                        predictions_va_tmp2)
+                    predictions_te /= n_fge + 1
+                    predictions_va /= n_fge + 1
+                    report_perf(valid_dataset, predictions_va, threshold, idx, epoch
+                                , desc='val set (fge)')
+                    predictions_tes.append(predictions_te_tmp2.reshape([-1, 1]))
+                    predictions_vas.append(predictions_va_tmp2.reshape([-1, 1]))
+                    n_fge += 1
 
-            global_steps += 1
-            batch_time.update(time.time() - end)
-            end = time.time()
-            if global_steps % print_every_step == 0:
-                curr_gpu_memory_usage = get_gpu_memory_usage(device_id=torch.cuda.current_device())
-                print('Global step: {}/{} Total loss: {:.4f}  Current GPU memory '
-                      'usage: {} maxlen {} '.format(global_steps, total_steps, avg(loss_list), curr_gpu_memory_usage,
-                                                    mean_len.avg))
-                loss_list = []
+                clr.on_batch_end()
+            if not fine_tuning:
+                predictions_va = eval_model(model, valid_iter, device, valid_index_reverse)
+                report_perf(valid_dataset, predictions_va, threshold, idx, epoch)
 
-            if fine_tuning and global_steps % (2 * clr.step_size) == 0:
-                predictions_te_tmp2 = eval_model(model, test_iter, device)
-                predictions_va_tmp2 = eval_model(model, valid_iter, device, valid_index_reverse)
-                report_perf(valid_dataset, predictions_va_tmp2, threshold, idx, epoch,
-                            desc='val set mean')
-                predictions_te = predictions_te * n_fge + (
-                    predictions_te_tmp2)
-                predictions_va = predictions_va * n_fge + (
-                    predictions_va_tmp2)
-                predictions_te /= n_fge + 1
-                predictions_va /= n_fge + 1
-                report_perf(valid_dataset, predictions_va, threshold, idx, epoch
-                            , desc='val set (fge)')
-                predictions_tes.append(predictions_te_tmp2.reshape([-1, 1]))
-                predictions_vas.append(predictions_va_tmp2.reshape([-1, 1]))
-                n_fge += 1
+            torch.save(model, model_path)
+            # reorder index
+            if predictions_te is not None:
+                predictions_te = predictions_te[tb.get_reverse_indexes()]
+            else:
+                predictions_te = eval_model(model, test_iter, device, tb.get_reverse_indexes())
+            best_score = -1
+            best_threshold = None
+            for t in np.arange(0, 1, 0.01):
+                score = f1_score(valid_dataset.targets, predictions_va > t)
+                if score > best_score:
+                    best_score = score
+                    best_threshold = t
+            print('best threshold on validation set: {:.2f} score {:.4f}'.format(best_threshold, best_score))
+            if not return_reduced and len(predictions_vas) > 0:
+                predictions_te = np.concatenate(predictions_tes, axis=1)
+                predictions_te = predictions_te[tb.get_reverse_indexes(), :]
+                predictions_va = np.concatenate(predictions_vas, axis=1)
 
-            clr.on_batch_end()
-        if not fine_tuning:
-            predictions_va = eval_model(model, valid_iter, device, valid_index_reverse)
-            report_perf(valid_dataset, predictions_va, threshold, idx, epoch)
-    # reorder index
-    torch.save(model.state_dict(), model_path)
-    if predictions_te is not None:
-        predictions_te = predictions_te[tb.get_reverse_indexes()]
+            # make predictions
+            return predictions_te, predictions_va, valid_dataset.targets, best_threshold
+
     else:
-        predictions_te = eval_model(model, test_iter, device, tb.get_reverse_indexes())
-    best_score = -1
-    best_threshold = None
-    for t in np.arange(0, 1, 0.01):
-        score = f1_score(valid_dataset.targets, predictions_va > t)
-        if score > best_score:
-            best_score = score
-            best_threshold = t
-    print('best threshold on validation set: {:.2f} score {:.4f}'.format(best_threshold, best_score))
-    if not return_reduced and len(predictions_vas) > 0:
-        predictions_te = np.concatenate(predictions_tes, axis=1)
-        predictions_te = predictions_te[tb.get_reverse_indexes(), :]
-        predictions_va = np.concatenate(predictions_vas, axis=1)
-
-    # make predictions
-    return predictions_te, predictions_va, valid_dataset.targets, best_threshold
+        predictions_te = eval_model(model, valid_iter, device, valid_index_reverse)
+        return predictions_te, None, None, None
 
 
-question_path = './question.txt'
-
+question_path = 'question.csv'
 
 if __name__ == '__main__':
     # seeding
@@ -747,9 +766,9 @@ if __name__ == '__main__':
     max_seq_len = 70
     share = True
     dropout = 0.1
+    is_training = False
     sub = pd.read_csv('./input/sample_submission.csv')
     train_df, test_df = load_data()
-    is_training = False
     # shuffling
     trn_idx = np.random.permutation(len(train_df))
     train_df = train_df.iloc[trn_idx].reset_index(drop=True)
@@ -759,7 +778,7 @@ if __name__ == '__main__':
             'max_vocab_size': max_vocab_size,
             'embed_size': embed_size, 'print_every_step': print_every_step, 'dropout': dropout,
             'learning_rate_max_offset': learning_rate_max_offset,
-            'fine_tuning_epochs': fine_tuning_epochs, 'max_seq_len': max_seq_len}
+            'fine_tuning_epochs': fine_tuning_epochs, 'max_seq_len': max_seq_len, 'is_training': is_training}
     predictions_te_all = np.zeros((len(test_df),))
     if is_training:
         for _ in range(n_repeats):
@@ -770,12 +789,11 @@ if __name__ == '__main__':
                 predictions_te, _, _, _ = main(train_df, test_df, test_df, **args)
             predictions_te_all += predictions_te / n_repeats
         sub.prediction = predictions_te_all > threshold
-        sub.to_csv("submission.csv", index=False)
+        sub.to_csv('submission.csv', index=False)
     else:
-        with open('question.txt') as file:
-            question = file.readline()
-            questionInput = [{'question_txt': clean_text(question)}]
-            print(questionInput)
-            # predictions_te, _, _, _ = main(train_df, test_df, test_df, **args)
-
-
+        question_df = load_question()
+        answer = pd.read_csv('./answer.csv')
+        predictions_te, _, _, _ = main(train_df, question_df, test_df, **args)
+        answer.qid = question_df.qid
+        answer.prediction = predictions_te > threshold
+        answer.to_csv('answer.csv', index=False)
